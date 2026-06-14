@@ -6,6 +6,10 @@ use serde::{Deserialize, Serialize};
 pub enum AgentType {
     Claude,
     OpenCode,
+    Codex,
+    Amp,
+    Pi,
+    Droid,
 }
 
 /// Represents a Claude Code session
@@ -50,6 +54,7 @@ pub struct SessionsResponse {
 /// Internal struct for parsing JSONL messages
 #[derive(Debug, Deserialize)]
 pub(crate) struct JsonlMessage {
+    pub id: Option<String>,
     #[serde(rename = "sessionId")]
     pub session_id: Option<String>,
     #[serde(rename = "gitBranch")]

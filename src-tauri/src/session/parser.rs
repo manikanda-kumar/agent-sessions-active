@@ -1,21 +1,26 @@
 use log::{debug, info, trace, warn};
+use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Mutex;
-use once_cell::sync::Lazy;
 
+use super::model::{AgentType, JsonlMessage, Session, SessionStatus, SessionsResponse};
+use super::status::{
+    determine_status, has_tool_result, has_tool_use, is_interrupted_request,
+    is_local_slash_command, is_waiting_for_user_input,
+};
 use crate::agent::AgentProcess;
-use super::model::{AgentType, Session, SessionStatus, SessionsResponse, JsonlMessage};
-use super::status::{determine_status, has_tool_use, has_tool_result, is_local_slash_command, is_interrupted_request, is_waiting_for_user_input};
 
 /// Track previous status for each session to detect transitions
-static PREVIOUS_STATUS: Lazy<Mutex<HashMap<String, SessionStatus>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+static PREVIOUS_STATUS: Lazy<Mutex<HashMap<String, SessionStatus>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 
 /// Cache git remote URLs by project path — remote URL never changes during app lifetime
-static GIT_URL_CACHE: Lazy<Mutex<HashMap<String, Option<String>>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+static GIT_URL_CACHE: Lazy<Mutex<HashMap<String, Option<String>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 
 /// Clean up PREVIOUS_STATUS entries for sessions that no longer exist.
 /// Call this after all agent detectors have run to prevent unbounded memory growth.
@@ -25,7 +30,11 @@ pub fn cleanup_stale_status_entries(active_session_ids: &std::collections::HashS
     prev_status_map.retain(|id, _| active_session_ids.contains(id));
     let removed = before_count - prev_status_map.len();
     if removed > 0 {
-        debug!("Cleaned up {} stale entries from PREVIOUS_STATUS (kept {})", removed, prev_status_map.len());
+        debug!(
+            "Cleaned up {} stale entries from PREVIOUS_STATUS (kept {})",
+            removed,
+            prev_status_map.len()
+        );
     }
 }
 
@@ -34,10 +43,15 @@ fn get_content_preview(content: &serde_json::Value) -> String {
     match content {
         serde_json::Value::String(s) => {
             let preview: String = s.chars().take(100).collect();
-            format!("text: \"{}{}\"", preview, if s.len() > 100 { "..." } else { "" })
+            format!(
+                "text: \"{}{}\"",
+                preview,
+                if s.len() > 100 { "..." } else { "" }
+            )
         }
         serde_json::Value::Array(arr) => {
-            let types: Vec<String> = arr.iter()
+            let types: Vec<String> = arr
+                .iter()
                 .filter_map(|v| v.get("type").and_then(|t| t.as_str()).map(String::from))
                 .collect();
             format!("blocks: [{}]", types.join(", "))
@@ -113,9 +127,7 @@ fn get_github_url_uncached(project_path: &str) -> Option<String> {
     // Already HTTPS format
     // https://github.com/user/repo.git -> https://github.com/user/repo
     if remote_url.starts_with("https://github.com/") {
-        let url = remote_url
-            .strip_suffix(".git")
-            .unwrap_or(&remote_url);
+        let url = remote_url.strip_suffix(".git").unwrap_or(&remote_url);
         return Some(url.to_string());
     }
 
@@ -172,7 +184,9 @@ pub fn convert_dir_name_to_path(dir_name: &str) -> String {
     }
 
     // Find "Projects" or "UnityProjects" index - everything after that is the project name
-    let projects_idx = parts.iter().position(|&p| p == "Projects" || p == "UnityProjects");
+    let projects_idx = parts
+        .iter()
+        .position(|&p| p == "Projects" || p == "UnityProjects");
 
     if let Some(idx) = projects_idx {
         // Path components are before and including "Projects"
@@ -241,6 +255,20 @@ pub fn get_sessions() -> SessionsResponse {
 /// Internal function to get sessions for a specific agent type
 /// Called by agent detectors (ClaudeDetector, OpenCodeDetector, etc.)
 pub fn get_sessions_internal(processes: &[AgentProcess], agent_type: AgentType) -> Vec<Session> {
+    let projects_dir = dirs::home_dir()
+        .map(|h| h.join(".claude").join("projects"))
+        .unwrap_or_default();
+    get_sessions_in_dir(processes, agent_type, projects_dir, "Claude projects")
+}
+
+/// Internal function to get sessions for Claude-style JSONL stores.
+/// Several agents write JSONL with cwd/message/timestamp fields but use different roots.
+pub fn get_sessions_in_dir(
+    processes: &[AgentProcess],
+    agent_type: AgentType,
+    projects_dir: PathBuf,
+    directory_label: &str,
+) -> Vec<Session> {
     info!("=== Getting sessions for {:?} ===", agent_type);
     debug!("Found {} processes total", processes.len());
 
@@ -250,41 +278,39 @@ pub fn get_sessions_internal(processes: &[AgentProcess], agent_type: AgentType) 
     let mut cwd_to_processes: HashMap<String, Vec<&AgentProcess>> = HashMap::new();
     // Pre-compute expected project directory names from process CWDs.
     // This lets us skip scanning directories that can't match any running process.
-    let mut expected_dir_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut expected_dir_names: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     for process in processes {
         if let Some(cwd) = &process.cwd {
             let cwd_str = cwd.to_string_lossy().to_string();
             debug!("Mapping process pid={} to cwd={}", process.pid, cwd_str);
             expected_dir_names.insert(convert_path_to_dir_name(&cwd_str));
+            expected_dir_names.insert(convert_path_to_pi_session_dir(&cwd_str));
             cwd_to_processes.entry(cwd_str).or_default().push(process);
         } else {
             warn!("Process pid={} has no cwd, skipping", process.pid);
         }
     }
 
-    // Scan ~/.claude/projects for session files
-    let claude_dir = dirs::home_dir()
-        .map(|h| h.join(".claude").join("projects"))
-        .unwrap_or_default();
+    debug!("{} directory: {:?}", directory_label, projects_dir);
 
-    debug!("Claude projects directory: {:?}", claude_dir);
-
-    if !claude_dir.exists() {
-        warn!("Claude projects directory does not exist: {:?}", claude_dir);
+    if !projects_dir.exists() {
+        warn!(
+            "{} directory does not exist: {:?}",
+            directory_label, projects_dir
+        );
         return sessions;
     }
 
     // For each project directory
-    if let Ok(entries) = fs::read_dir(&claude_dir) {
+    if let Ok(entries) = fs::read_dir(&projects_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
             if !path.is_dir() {
                 continue;
             }
 
-            let dir_name = path.file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("");
+            let dir_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
             // Skip directories that can't match any running process.
             // This avoids opening hundreds of JSONL files in inactive project directories.
@@ -306,16 +332,22 @@ pub fn get_sessions_internal(processes: &[AgentProcess], agent_type: AgentType) 
             // Build a map of cwd -> list of JSONL files with that cwd
             let mut cwd_to_files: HashMap<String, Vec<PathBuf>> = HashMap::new();
             for jsonl_file in &jsonl_files {
-                let file_cwd = extract_cwd_from_jsonl(jsonl_file)
-                    .unwrap_or_else(|| {
-                        // Fallback to decoded directory name if file has no cwd
-                        convert_dir_name_to_path(dir_name)
-                    });
-                cwd_to_files.entry(file_cwd).or_default().push(jsonl_file.clone());
+                let file_cwd = extract_cwd_from_jsonl(jsonl_file).unwrap_or_else(|| {
+                    // Fallback to decoded directory name if file has no cwd
+                    convert_dir_name_to_path(dir_name)
+                });
+                cwd_to_files
+                    .entry(file_cwd)
+                    .or_default()
+                    .push(jsonl_file.clone());
             }
 
-            debug!("Project {} has {} distinct cwds across {} files",
-                   dir_name, cwd_to_files.len(), jsonl_files.len());
+            debug!(
+                "Project {} has {} distinct cwds across {} files",
+                dir_name,
+                cwd_to_files.len(),
+                jsonl_files.len()
+            );
 
             // For each unique cwd, find matching processes and create sessions
             for (project_path, files_for_cwd) in &cwd_to_files {
@@ -324,50 +356,79 @@ pub fn get_sessions_internal(processes: &[AgentProcess], agent_type: AgentType) 
                     None => continue,
                 };
 
-                debug!("  cwd {} -> {} processes, {} files",
-                       project_path, matching_processes.len(), files_for_cwd.len());
+                debug!(
+                    "  cwd {} -> {} processes, {} files",
+                    project_path,
+                    matching_processes.len(),
+                    files_for_cwd.len()
+                );
 
                 // Match processes to JSONL files
                 for (index, process) in matching_processes.iter().enumerate() {
-                    debug!("Matching process pid={} to JSONL file index {}", process.pid, index);
-                    if let Some(session) = find_session_for_process(files_for_cwd, &path, project_path, process, index, agent_type.clone()) {
-                    // Track status transitions
-                    let mut prev_status_map = PREVIOUS_STATUS.lock().unwrap();
-                    let prev_status = prev_status_map.get(&session.id).cloned();
+                    debug!(
+                        "Matching process pid={} to JSONL file index {}",
+                        process.pid, index
+                    );
+                    if let Some(session) = find_session_for_process(
+                        files_for_cwd,
+                        &path,
+                        project_path,
+                        process,
+                        index,
+                        agent_type.clone(),
+                    ) {
+                        // Track status transitions
+                        let mut prev_status_map = PREVIOUS_STATUS.lock().unwrap();
+                        let prev_status = prev_status_map.get(&session.id).cloned();
 
-                    // Log status transition if it changed
-                    if let Some(prev) = &prev_status {
-                        if *prev != session.status {
-                            warn!(
+                        // Log status transition if it changed
+                        if let Some(prev) = &prev_status {
+                            if *prev != session.status {
+                                warn!(
                                 "STATUS TRANSITION: project={}, {:?} -> {:?}, cpu={:.1}%, file_age=?, last_msg_role={:?}",
                                 session.project_name, prev, session.status, session.cpu_usage, session.last_message_role
                             );
+                            }
                         }
+
+                        // Update stored status
+                        prev_status_map.insert(session.id.clone(), session.status.clone());
+                        drop(prev_status_map);
+
+                        info!(
+                            "Session created: id={}, project={}, status={:?}, pid={}, cpu={:.1}%",
+                            session.id,
+                            session.project_name,
+                            session.status,
+                            session.pid,
+                            session.cpu_usage
+                        );
+                        sessions.push(session);
+                    } else {
+                        warn!(
+                            "Failed to create session for process pid={} in project {}",
+                            process.pid, project_path
+                        );
                     }
-
-                    // Update stored status
-                    prev_status_map.insert(session.id.clone(), session.status.clone());
-                    drop(prev_status_map);
-
-                    info!(
-                        "Session created: id={}, project={}, status={:?}, pid={}, cpu={:.1}%",
-                        session.id, session.project_name, session.status, session.pid, session.cpu_usage
-                    );
-                    sessions.push(session);
-                } else {
-                    warn!("Failed to create session for process pid={} in project {}", process.pid, project_path);
                 }
-            }
             }
         }
     }
 
     info!(
         "=== Session scan complete for {:?}: {} total ===",
-        agent_type, sessions.len()
+        agent_type,
+        sessions.len()
     );
 
     sessions
+}
+
+/// Pi stores project sessions as --Users-name-project-- instead of Claude's
+/// -Users-name-project encoding.
+pub fn convert_path_to_pi_session_dir(path: &str) -> String {
+    let path = path.strip_prefix('/').unwrap_or(path);
+    format!("--{}--", path.replace('/', "-"))
 }
 
 /// Check if a JSONL file is a subagent file (named agent-*.jsonl)
@@ -423,7 +484,11 @@ fn count_active_subagents(project_dir: &PathBuf, parent_session_id: &str) -> usi
         })
         .count();
 
-    trace!("Found {} active subagents for session {}", count, parent_session_id);
+    trace!(
+        "Found {} active subagents for session {}",
+        count,
+        parent_session_id
+    );
     count
 }
 
@@ -436,10 +501,7 @@ fn get_recently_active_jsonl_files(project_dir: &PathBuf, _expected_count: usize
         .flatten()
         .filter(|e| {
             let path = e.path();
-            path.extension()
-                .map(|ext| ext == "jsonl")
-                .unwrap_or(false)
-                && !is_subagent_file(&path)
+            path.extension().map(|ext| ext == "jsonl").unwrap_or(false) && !is_subagent_file(&path)
         })
         .filter_map(|e| {
             let path = e.path();
@@ -451,10 +513,7 @@ fn get_recently_active_jsonl_files(project_dir: &PathBuf, _expected_count: usize
     // Sort by modification time (newest first)
     jsonl_files.sort_by(|a, b| b.1.cmp(&a.1));
 
-    jsonl_files
-        .into_iter()
-        .map(|(path, _)| path)
-        .collect()
+    jsonl_files.into_iter().map(|(path, _)| path).collect()
 }
 
 /// Find a session for a specific process from available JSONL files
@@ -467,7 +526,13 @@ fn find_session_for_process(
     agent_type: AgentType,
 ) -> Option<Session> {
     let jsonl_path = jsonl_files.get(index)?;
-    let mut session = parse_session_file(jsonl_path, project_path, process.pid, process.cpu_usage, agent_type)?;
+    let mut session = parse_session_file(
+        jsonl_path,
+        project_path,
+        process.pid,
+        process.cpu_usage,
+        agent_type,
+    )?;
 
     // Count active subagents for this session
     session.active_subagent_count = count_active_subagents(project_dir, &session.id);
@@ -539,12 +604,22 @@ pub fn parse_session_file(
     let lines: Vec<_> = reader.lines().flatten().collect();
     let recent_lines: Vec<_> = lines.iter().rev().take(500).collect();
 
-    trace!("File has {} total lines, checking last {}", lines.len(), recent_lines.len());
+    trace!(
+        "File has {} total lines, checking last {}",
+        lines.len(),
+        recent_lines.len()
+    );
 
     for line in &recent_lines {
         if let Ok(msg) = serde_json::from_str::<JsonlMessage>(line) {
             if session_id.is_none() {
-                session_id = msg.session_id;
+                session_id = msg.session_id.or_else(|| {
+                    if matches!(msg.msg_type.as_deref(), Some("session" | "session_start")) {
+                        msg.id
+                    } else {
+                        None
+                    }
+                });
             }
             if git_branch.is_none() {
                 git_branch = msg.git_branch;
@@ -611,13 +686,12 @@ pub fn parse_session_file(
                 if let Some(c) = &content.content {
                     let text = match c {
                         serde_json::Value::String(s) if !s.is_empty() => Some(s.clone()),
-                        serde_json::Value::Array(arr) => {
-                            arr.iter().find_map(|v| {
-                                v.get("text").and_then(|t| t.as_str())
-                                    .filter(|s| !s.is_empty())
-                                    .map(String::from)
-                            })
-                        }
+                        serde_json::Value::Array(arr) => arr.iter().find_map(|v| {
+                            v.get("text")
+                                .and_then(|t| t.as_str())
+                                .filter(|s| !s.is_empty())
+                                .map(String::from)
+                        }),
                         _ => None,
                     };
 

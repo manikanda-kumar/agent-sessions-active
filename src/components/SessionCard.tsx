@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { Session } from '../types/session';
+import { AgentType, Session } from '../types/session';
 import { Card, CardContent } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -37,13 +37,28 @@ const OpenCodeIcon = ({ className }: { className?: string }) => (
   </svg>
 );
 
-// Agent icon - Claude always orange (brand color), OpenCode uses status color
-const AgentStatusIcon = ({ type, statusColor }: { type: 'claude' | 'opencode', statusColor: string }) => {
+const LetterIcon = ({ label, className }: { label: string; className?: string }) => (
+  <span className={`w-4 h-4 inline-flex items-center justify-center rounded-[3px] text-[10px] font-semibold ${className || ''}`}>
+    {label}
+  </span>
+);
+
+// Agent icon - Claude always orange (brand color), other agents use status color
+const AgentStatusIcon = ({ type, statusColor }: { type: AgentType, statusColor: string }) => {
   if (type === 'claude') {
     // Claude brand color: coral/orange #D77655
     return <ClaudeIcon className="w-4 h-4 fill-[#D77655]" />;
   }
-  return <OpenCodeIcon className={`w-4 h-4 ${statusColor}`} />;
+  if (type === 'opencode') {
+    return <OpenCodeIcon className={`w-4 h-4 ${statusColor}`} />;
+  }
+  const labels: Record<Exclude<AgentType, 'claude' | 'opencode'>, string> = {
+    codex: 'C',
+    amp: 'A',
+    pi: 'Pi',
+    droid: 'D',
+  };
+  return <LetterIcon label={labels[type]} className={`${statusColor} border border-current/30 bg-current/10`} />;
 };
 
 interface SessionCardProps {

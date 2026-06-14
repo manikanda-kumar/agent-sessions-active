@@ -1,6 +1,6 @@
+use std::sync::Mutex;
 use tauri::Manager;
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut};
-use std::sync::Mutex;
 
 use crate::session::{get_sessions, SessionsResponse};
 use crate::terminal;
@@ -23,7 +23,11 @@ pub fn focus_session(pid: u32, project_path: String) -> Result<(), String> {
 
 /// Update the tray icon title with session counts
 #[tauri::command]
-pub fn update_tray_title(app: tauri::AppHandle, total: usize, waiting: usize) -> Result<(), String> {
+pub fn update_tray_title(
+    app: tauri::AppHandle,
+    total: usize,
+    waiting: usize,
+) -> Result<(), String> {
     let title = if waiting > 0 {
         format!("{} ({} idle)", total, waiting)
     } else if total > 0 {
@@ -48,7 +52,8 @@ pub fn register_shortcut(app: tauri::AppHandle, shortcut: String) -> Result<(), 
     }
 
     // Parse the shortcut string
-    let parsed_shortcut: Shortcut = shortcut.parse()
+    let parsed_shortcut: Shortcut = shortcut
+        .parse()
         .map_err(|e| format!("Invalid shortcut format: {}", e))?;
 
     // Register the new shortcut - toggle window visibility

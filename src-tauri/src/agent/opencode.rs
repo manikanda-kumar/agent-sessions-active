@@ -113,12 +113,19 @@ fn get_opencode_sessions(processes: &[AgentProcess]) -> Vec<Session> {
     // OpenCode data directory: ~/.local/share/opencode/storage/
     // Note: OpenCode uses XDG convention, not macOS Application Support
     let storage_path = match dirs::home_dir() {
-        Some(home) => home.join(".local").join("share").join("opencode").join("storage"),
+        Some(home) => home
+            .join(".local")
+            .join("share")
+            .join("opencode")
+            .join("storage"),
         None => return sessions,
     };
 
     if !storage_path.exists() {
-        log::debug!("OpenCode storage directory does not exist: {:?}", storage_path);
+        log::debug!(
+            "OpenCode storage directory does not exist: {:?}",
+            storage_path
+        );
         return sessions;
     }
 
@@ -148,7 +155,9 @@ fn get_opencode_sessions(processes: &[AgentProcess]) -> Vec<Session> {
             .iter()
             .find(|(cwd, _)| {
                 // Check if cwd matches the project worktree
-                if cwd.as_str() == project.worktree || cwd.starts_with(&format!("{}/", project.worktree)) {
+                if cwd.as_str() == project.worktree
+                    || cwd.starts_with(&format!("{}/", project.worktree))
+                {
                     return true;
                 }
                 // Check if cwd matches any sandbox (worktree/branch)
@@ -162,7 +171,11 @@ fn get_opencode_sessions(processes: &[AgentProcess]) -> Vec<Session> {
             .map(|(_, p)| *p);
 
         if let Some(process) = matching_process {
-            log::debug!("Project {} matched to process pid={}", project.worktree, process.pid);
+            log::debug!(
+                "Project {} matched to process pid={}",
+                project.worktree,
+                process.pid
+            );
             matched_pids.insert(process.pid);
             if let Some(session) = get_latest_session_for_project(&storage_path, project, process) {
                 sessions.push(session);
@@ -177,8 +190,14 @@ fn get_opencode_sessions(processes: &[AgentProcess]) -> Vec<Session> {
         }
         if let Some(cwd) = &process.cwd {
             let cwd_str = cwd.to_string_lossy().to_string();
-            if let Some(session) = get_global_session_for_directory(&storage_path, &cwd_str, process) {
-                log::debug!("Global session matched for directory {} to process pid={}", cwd_str, process.pid);
+            if let Some(session) =
+                get_global_session_for_directory(&storage_path, &cwd_str, process)
+            {
+                log::debug!(
+                    "Global session matched for directory {} to process pid={}",
+                    cwd_str,
+                    process.pid
+                );
                 sessions.push(session);
             }
         }
@@ -230,7 +249,11 @@ fn get_latest_session_for_project(
                 if let Ok(content) = std::fs::read_to_string(&path) {
                     if let Ok(session) = serde_json::from_str::<OpenCodeSession>(&content) {
                         let updated = session.time.updated;
-                        if latest_session.as_ref().map(|(_, t)| updated > *t).unwrap_or(true) {
+                        if latest_session
+                            .as_ref()
+                            .map(|(_, t)| updated > *t)
+                            .unwrap_or(true)
+                        {
                             latest_session = Some((session, updated));
                         }
                     }
@@ -242,7 +265,8 @@ fn get_latest_session_for_project(
     let (session, _) = latest_session?;
 
     // Get the last message for status detection and display
-    let (last_role, last_message_text, _last_message_time) = get_last_message(storage_path, &session.id);
+    let (last_role, last_message_text, _last_message_time) =
+        get_last_message(storage_path, &session.id);
 
     // Determine status
     let status = if process.cpu_usage > 5.0 {
@@ -262,7 +286,8 @@ fn get_latest_session_for_project(
         .unwrap_or_else(|| "Unknown".to_string());
 
     // Use actual process CWD for display (may be sandbox/worktree path)
-    let actual_path = process.cwd
+    let actual_path = process
+        .cwd
         .as_ref()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|| project.worktree.clone());
@@ -277,12 +302,16 @@ fn get_latest_session_for_project(
 
     log::info!(
         "OpenCode session: id={}, project={}, status={:?}, last_role={:?}, cpu={:.1}%",
-        session.id, project_name, status, last_role, process.cpu_usage
+        session.id,
+        project_name,
+        status,
+        last_role,
+        process.cpu_usage
     );
 
     // Use message text if available, fall back to session title
-    let display_message = last_message_text
-        .or_else(|| Some(session.title.clone()).filter(|t| !t.is_empty()));
+    let display_message =
+        last_message_text.or_else(|| Some(session.title.clone()).filter(|t| !t.is_empty()));
 
     Some(Session {
         id: session.id,
@@ -302,7 +331,10 @@ fn get_latest_session_for_project(
 }
 
 /// Get the last message role, time, and text for a session
-fn get_last_message(storage_path: &PathBuf, session_id: &str) -> (Option<String>, Option<String>, u64) {
+fn get_last_message(
+    storage_path: &PathBuf,
+    session_id: &str,
+) -> (Option<String>, Option<String>, u64) {
     let message_dir = storage_path.join("message").join(session_id);
 
     if !message_dir.exists() {
@@ -336,13 +368,22 @@ fn get_last_message(storage_path: &PathBuf, session_id: &str) -> (Option<String>
         if let Some(text) = get_message_text(storage_path, &message_id) {
             log::debug!(
                 "Session {} has {} messages, showing: id={}, role={}, created={}, text={:?}",
-                session_id, message_count, message_id, role, time, &text[..text.len().min(50)]
+                session_id,
+                message_count,
+                message_id,
+                role,
+                time,
+                &text[..text.len().min(50)]
             );
             return (Some(role), Some(text), time);
         }
     }
 
-    log::debug!("Session {} has {} messages but no displayable text", session_id, message_count);
+    log::debug!(
+        "Session {} has {} messages but no displayable text",
+        session_id,
+        message_count
+    );
     (None, None, 0)
 }
 
@@ -420,9 +461,15 @@ fn get_global_session_for_directory(
                 if let Ok(content) = std::fs::read_to_string(&path) {
                     if let Ok(session) = serde_json::from_str::<OpenCodeSession>(&content) {
                         // Check if this session's directory matches or is a parent of the process CWD
-                        if directory == session.directory || directory.starts_with(&format!("{}/", session.directory)) {
+                        if directory == session.directory
+                            || directory.starts_with(&format!("{}/", session.directory))
+                        {
                             let updated = session.time.updated;
-                            if latest_session.as_ref().map(|(_, t)| updated > *t).unwrap_or(true) {
+                            if latest_session
+                                .as_ref()
+                                .map(|(_, t)| updated > *t)
+                                .unwrap_or(true)
+                            {
                                 latest_session = Some((session, updated));
                             }
                         }
@@ -435,7 +482,8 @@ fn get_global_session_for_directory(
     let (session, _) = latest_session?;
 
     // Get the last message for status detection and display
-    let (last_role, last_message_text, _last_message_time) = get_last_message(storage_path, &session.id);
+    let (last_role, last_message_text, _last_message_time) =
+        get_last_message(storage_path, &session.id);
 
     // Determine status
     let status = if process.cpu_usage > 5.0 {
@@ -455,7 +503,8 @@ fn get_global_session_for_directory(
         .unwrap_or_else(|| "Unknown".to_string());
 
     // Extract project name from session directory
-    let project_name = session.directory
+    let project_name = session
+        .directory
         .split('/')
         .filter(|s| !s.is_empty())
         .last()
@@ -464,12 +513,16 @@ fn get_global_session_for_directory(
 
     log::info!(
         "OpenCode global session: id={}, directory={}, status={:?}, last_role={:?}, cpu={:.1}%",
-        session.id, session.directory, status, last_role, process.cpu_usage
+        session.id,
+        session.directory,
+        status,
+        last_role,
+        process.cpu_usage
     );
 
     // Use message text if available, fall back to session title
-    let display_message = last_message_text
-        .or_else(|| Some(session.title.clone()).filter(|t| !t.is_empty()));
+    let display_message =
+        last_message_text.or_else(|| Some(session.title.clone()).filter(|t| !t.is_empty()));
 
     Some(Session {
         id: session.id,

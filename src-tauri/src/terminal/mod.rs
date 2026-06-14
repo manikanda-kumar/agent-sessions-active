@@ -27,7 +27,8 @@ pub fn focus_terminal_for_pid(pid: u32) -> Result<(), String> {
 /// Fallback: focus terminal by matching path in session name
 pub fn focus_terminal_by_path(path: &str) -> Result<(), String> {
     // Fallback: focus by matching session name (which often contains the path) in iTerm2
-    let script = format!(r#"
+    let script = format!(
+        r#"
         tell application "System Events"
             if exists process "iTerm2" then
                 tell application "iTerm2"
@@ -48,7 +49,9 @@ pub fn focus_terminal_by_path(path: &str) -> Result<(), String> {
             end if
         end tell
         return "not found"
-    "#, path.split('/').last().unwrap_or(path));
+    "#,
+        path.split('/').last().unwrap_or(path)
+    );
 
     execute_applescript(&script)
 }

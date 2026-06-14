@@ -73,8 +73,8 @@ fn test_find_claude_processes_returns_vec() {
                 .with_cmd(sysinfo::UpdateKind::Always)
                 .with_cwd(sysinfo::UpdateKind::Always)
                 .with_cpu()
-                .with_memory()
-        )
+                .with_memory(),
+        ),
     );
     system.refresh_processes_specifics(
         sysinfo::ProcessesToUpdate::All,
@@ -82,7 +82,7 @@ fn test_find_claude_processes_returns_vec() {
             .with_cmd(sysinfo::UpdateKind::Always)
             .with_cwd(sysinfo::UpdateKind::Always)
             .with_cpu()
-            .with_memory()
+            .with_memory(),
     );
     let processes = find_claude_processes(&system);
     // Should return a Vec (possibly empty) - just verify we got a result
@@ -99,8 +99,8 @@ fn test_find_claude_processes_excludes_orphans() {
                 .with_cmd(sysinfo::UpdateKind::Always)
                 .with_cwd(sysinfo::UpdateKind::Always)
                 .with_cpu()
-                .with_memory()
-        )
+                .with_memory(),
+        ),
     );
     system.refresh_processes_specifics(
         sysinfo::ProcessesToUpdate::All,
@@ -108,7 +108,7 @@ fn test_find_claude_processes_excludes_orphans() {
             .with_cmd(sysinfo::UpdateKind::Always)
             .with_cwd(sysinfo::UpdateKind::Always)
             .with_cpu()
-            .with_memory()
+            .with_memory(),
     );
 
     let processes = find_claude_processes(&system);
@@ -134,15 +134,15 @@ fn test_is_orphaned_process_with_current_process() {
             ProcessRefreshKind::new()
                 .with_cmd(sysinfo::UpdateKind::Always)
                 .with_cwd(sysinfo::UpdateKind::Always)
-                .with_cpu()
-        )
+                .with_cpu(),
+        ),
     );
     system.refresh_processes_specifics(
         sysinfo::ProcessesToUpdate::All,
         ProcessRefreshKind::new()
             .with_cmd(sysinfo::UpdateKind::Always)
             .with_cwd(sysinfo::UpdateKind::Always)
-            .with_cpu()
+            .with_cpu(),
     );
 
     let current_pid = sysinfo::Pid::from_u32(std::process::id());
@@ -163,15 +163,15 @@ fn test_is_orphaned_process_with_launchd() {
             ProcessRefreshKind::new()
                 .with_cmd(sysinfo::UpdateKind::Always)
                 .with_cwd(sysinfo::UpdateKind::Always)
-                .with_cpu()
-        )
+                .with_cpu(),
+        ),
     );
     system.refresh_processes_specifics(
         sysinfo::ProcessesToUpdate::All,
         ProcessRefreshKind::new()
             .with_cmd(sysinfo::UpdateKind::Always)
             .with_cwd(sysinfo::UpdateKind::Always)
-            .with_cpu()
+            .with_cpu(),
     );
 
     // launchd (PID 1) has no parent or parent is 0 - test shouldn't panic

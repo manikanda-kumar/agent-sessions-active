@@ -1,12 +1,13 @@
-use crate::session::{
-    AgentType, SessionStatus, parse_session_file, convert_dir_name_to_path, convert_path_to_dir_name,
-    determine_status, status_sort_priority, has_tool_use, has_tool_result, is_local_slash_command,
-    is_interrupted_request, is_waiting_for_user_input, cleanup_stale_status_entries, get_sessions_internal
-};
 use crate::agent::AgentProcess;
+use crate::session::{
+    cleanup_stale_status_entries, convert_dir_name_to_path, convert_path_to_dir_name,
+    convert_path_to_pi_session_dir, determine_status, get_sessions_internal, has_tool_result,
+    has_tool_use, is_interrupted_request, is_local_slash_command, is_waiting_for_user_input,
+    parse_session_file, status_sort_priority, AgentType, SessionStatus,
+};
 use serde_json::json;
 use std::io::Write;
-use std::time::{SystemTime, Duration};
+use std::time::{Duration, SystemTime};
 use tempfile::NamedTempFile;
 
 // Helper functions
@@ -90,7 +91,9 @@ fn test_convert_path_to_dir_name() {
 
     // Path with hidden folder (.rsworktree)
     assert_eq!(
-        convert_path_to_dir_name("/Users/ozan/Projects/unity-build-service/.rsworktree/improve-prov-prof-creation"),
+        convert_path_to_dir_name(
+            "/Users/ozan/Projects/unity-build-service/.rsworktree/improve-prov-prof-creation"
+        ),
         "-Users-ozan-Projects-unity-build-service--rsworktree-improve-prov-prof-creation"
     );
 
@@ -104,6 +107,14 @@ fn test_convert_path_to_dir_name() {
     assert_eq!(
         convert_path_to_dir_name("/Users/ozan/Projects/autogoals-v2/examples/test"),
         "-Users-ozan-Projects-autogoals-v2-examples-test"
+    );
+}
+
+#[test]
+fn test_convert_path_to_pi_session_dir() {
+    assert_eq!(
+        convert_path_to_pi_session_dir("/Users/ozan/Projects/ai-image-dashboard"),
+        "--Users-ozan-Projects-ai-image-dashboard--"
     );
 }
 
@@ -280,25 +291,17 @@ fn test_determine_status_assistant_with_tool_use() {
     assert!(matches!(status, SessionStatus::Processing));
 
     // Same with recent file activity
-    let status = determine_status(
-        Some("assistant"),
-        true,
-        false,
-        false,
-        false,
-        false,
-        true,
-    );
+    let status = determine_status(Some("assistant"), true, false, false, false, false, true);
     assert!(matches!(status, SessionStatus::Processing));
 
     // AskUserQuestion tool_use -> Waiting (waiting for user input)
     let status = determine_status(
         Some("assistant"),
-        true,  // has_tool_use
+        true, // has_tool_use
         false,
         false,
         false,
-        true,  // is_user_input_tool
+        true, // is_user_input_tool
         false,
     );
     assert!(matches!(status, SessionStatus::Waiting));
@@ -319,15 +322,7 @@ fn test_determine_status_assistant_text_only() {
     assert!(matches!(status, SessionStatus::Waiting));
 
     // With recent file activity, text-only assistant = Processing (still streaming/compacting)
-    let status = determine_status(
-        Some("assistant"),
-        false,
-        false,
-        false,
-        false,
-        false,
-        true,
-    );
+    let status = determine_status(Some("assistant"), false, false, false, false, false, true);
     assert!(matches!(status, SessionStatus::Processing));
 }
 
@@ -346,15 +341,7 @@ fn test_determine_status_user_message() {
     assert!(matches!(status, SessionStatus::Thinking));
 
     // User message with recent file activity -> Thinking
-    let status = determine_status(
-        Some("user"),
-        false,
-        false,
-        false,
-        false,
-        false,
-        true,
-    );
+    let status = determine_status(Some("user"), false, false, false, false, false, true);
     assert!(matches!(status, SessionStatus::Thinking));
 
     // User message that's a local command -> Waiting
@@ -388,7 +375,7 @@ fn test_determine_status_user_with_tool_result() {
     let status = determine_status(
         Some("user"),
         false,
-        true,  // has_tool_result
+        true, // has_tool_result
         false,
         false,
         false,
@@ -397,50 +384,30 @@ fn test_determine_status_user_with_tool_result() {
     assert!(matches!(status, SessionStatus::Thinking));
 
     // Same with recent file activity
-    let status = determine_status(
-        Some("user"),
-        false,
-        true,
-        false,
-        false,
-        false,
-        true,
-    );
+    let status = determine_status(Some("user"), false, true, false, false, false, true);
     assert!(matches!(status, SessionStatus::Thinking));
 }
 
 #[test]
 fn test_determine_status_unknown_type() {
     // Unknown message type with recent file activity -> Processing
-    let status = determine_status(
-        None,
-        false,
-        false,
-        false,
-        false,
-        false,
-        true,
-    );
+    let status = determine_status(None, false, false, false, false, false, true);
     assert!(matches!(status, SessionStatus::Processing));
 
     // Unknown message type, file stale -> Waiting
-    let status = determine_status(
-        None,
-        false,
-        false,
-        false,
-        false,
-        false,
-        false,
-    );
+    let status = determine_status(None, false, false, false, false, false, false);
     assert!(matches!(status, SessionStatus::Waiting));
 }
 
 #[test]
 fn test_is_interrupted_request() {
     // Message with interruption text
-    assert!(is_interrupted_request(&json!("[Request interrupted by user]")));
-    assert!(is_interrupted_request(&json!("Some text [Request interrupted by user] more text")));
+    assert!(is_interrupted_request(&json!(
+        "[Request interrupted by user]"
+    )));
+    assert!(is_interrupted_request(&json!(
+        "Some text [Request interrupted by user] more text"
+    )));
 
     // Array content with interruption
     let array_content = json!([
@@ -470,8 +437,13 @@ fn test_status_sort_priority() {
     assert_eq!(status_sort_priority(&SessionStatus::Idle), 2);
 
     // Verify ordering: Thinking/Processing < Waiting < Idle
-    assert!(status_sort_priority(&SessionStatus::Thinking) < status_sort_priority(&SessionStatus::Waiting));
-    assert!(status_sort_priority(&SessionStatus::Waiting) < status_sort_priority(&SessionStatus::Idle));
+    assert!(
+        status_sort_priority(&SessionStatus::Thinking)
+            < status_sort_priority(&SessionStatus::Waiting)
+    );
+    assert!(
+        status_sort_priority(&SessionStatus::Waiting) < status_sort_priority(&SessionStatus::Idle)
+    );
 }
 
 #[test]
@@ -509,12 +481,66 @@ fn test_parse_jsonl_assistant_text_only_is_waiting() {
         r#"{"sessionId":"test-session","type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Hello! How can I help you today?"}]},"timestamp":"2024-01-01T00:00:01Z"}"#,
     ]);
 
-    let session = parse_session_file(&jsonl.path().to_path_buf(), "/Users/test/Projects/test-project", TEST_PID, TEST_CPU_USAGE, AgentType::Claude);
+    let session = parse_session_file(
+        &jsonl.path().to_path_buf(),
+        "/Users/test/Projects/test-project",
+        TEST_PID,
+        TEST_CPU_USAGE,
+        AgentType::Claude,
+    );
 
     assert!(session.is_some());
     let session = session.unwrap();
-    assert!(matches!(session.status, SessionStatus::Waiting),
-        "Expected Waiting when last message is assistant text-only, got {:?}", session.status);
+    assert!(
+        matches!(session.status, SessionStatus::Waiting),
+        "Expected Waiting when last message is assistant text-only, got {:?}",
+        session.status
+    );
+}
+
+#[test]
+fn test_parse_pi_session_line_id() {
+    let jsonl = create_test_jsonl_old(&[
+        r#"{"type":"session","version":3,"id":"pi-session","timestamp":"2026-04-21T16:29:10.777Z","cwd":"/Users/test/Projects/test-project"}"#,
+        r#"{"type":"message","id":"msg-1","timestamp":"2026-04-21T16:30:05.901Z","message":{"role":"user","content":[{"type":"text","text":"Fix this"}]}}"#,
+        r#"{"type":"message","id":"msg-2","timestamp":"2026-04-21T16:30:13.633Z","message":{"role":"assistant","content":[{"type":"text","text":"Done"}]}}"#,
+    ]);
+
+    let session = parse_session_file(
+        &jsonl.path().to_path_buf(),
+        "/Users/test/Projects/test-project",
+        TEST_PID,
+        TEST_CPU_USAGE,
+        AgentType::Pi,
+    )
+    .unwrap();
+
+    assert_eq!(session.id, "pi-session");
+    assert_eq!(session.agent_type, AgentType::Pi);
+    assert!(matches!(session.status, SessionStatus::Waiting));
+}
+
+#[test]
+fn test_parse_factory_session_start_id() {
+    let jsonl = create_test_jsonl_old(&[
+        r#"{"type":"session_start","id":"factory-session","title":"Review implementation","sessionTitle":"Reviewing implementation","owner":"manik","version":2,"cwd":"/Users/test/Projects/test-project","hostId":"host-1"}"#,
+        r#"{"type":"message","id":"msg-1","timestamp":"2026-06-14T16:30:05.901Z","message":{"role":"user","content":[{"type":"text","text":"Check this"}]}}"#,
+        r#"{"type":"message","id":"msg-2","timestamp":"2026-06-14T16:30:13.633Z","message":{"role":"assistant","content":[{"type":"text","text":"Looks good"}]}}"#,
+    ]);
+
+    let session = parse_session_file(
+        &jsonl.path().to_path_buf(),
+        "/Users/test/Projects/test-project",
+        TEST_PID,
+        TEST_CPU_USAGE,
+        AgentType::Droid,
+    )
+    .unwrap();
+
+    assert_eq!(session.id, "factory-session");
+    assert_eq!(session.agent_type, AgentType::Droid);
+    assert_eq!(session.last_message.as_deref(), Some("Looks good"));
+    assert!(matches!(session.status, SessionStatus::Waiting));
 }
 
 #[test]
@@ -526,12 +552,21 @@ fn test_parse_jsonl_assistant_with_tool_use_is_processing() {
         r#"{"sessionId":"test-session","type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Let me list the files"},{"type":"tool_use","id":"123","name":"Bash","input":{"command":"ls"}}]},"timestamp":"2024-01-01T00:00:01Z"}"#,
     ]);
 
-    let session = parse_session_file(&jsonl.path().to_path_buf(), "/Users/test/Projects/test-project", TEST_PID, TEST_CPU_USAGE, AgentType::Claude);
+    let session = parse_session_file(
+        &jsonl.path().to_path_buf(),
+        "/Users/test/Projects/test-project",
+        TEST_PID,
+        TEST_CPU_USAGE,
+        AgentType::Claude,
+    );
 
     assert!(session.is_some());
     let session = session.unwrap();
-    assert!(matches!(session.status, SessionStatus::Processing),
-        "Expected Processing when last message is assistant with tool_use, got {:?}", session.status);
+    assert!(
+        matches!(session.status, SessionStatus::Processing),
+        "Expected Processing when last message is assistant with tool_use, got {:?}",
+        session.status
+    );
 }
 
 #[test]
@@ -543,12 +578,21 @@ fn test_parse_jsonl_user_message_is_thinking() {
         r#"{"sessionId":"test-session","type":"user","message":{"role":"user","content":"Fix the bug in main.rs"},"timestamp":"2024-01-01T00:00:01Z"}"#,
     ]);
 
-    let session = parse_session_file(&jsonl.path().to_path_buf(), "/Users/test/Projects/test-project", TEST_PID, TEST_CPU_USAGE, AgentType::Claude);
+    let session = parse_session_file(
+        &jsonl.path().to_path_buf(),
+        "/Users/test/Projects/test-project",
+        TEST_PID,
+        TEST_CPU_USAGE,
+        AgentType::Claude,
+    );
 
     assert!(session.is_some());
     let session = session.unwrap();
-    assert!(matches!(session.status, SessionStatus::Thinking),
-        "Expected Thinking when last message is user input, got {:?}", session.status);
+    assert!(
+        matches!(session.status, SessionStatus::Thinking),
+        "Expected Thinking when last message is user input, got {:?}",
+        session.status
+    );
 }
 
 #[test]
@@ -561,14 +605,23 @@ fn test_parse_jsonl_user_tool_result_is_thinking() {
         r#"{"sessionId":"test-session","type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"123","content":"file1.txt\nfile2.txt"}]},"timestamp":"2024-01-01T00:00:01Z"}"#,
     ]);
 
-    let session = parse_session_file(&jsonl.path().to_path_buf(), "/Users/test/Projects/test-project", TEST_PID, TEST_CPU_USAGE, AgentType::Claude);
+    let session = parse_session_file(
+        &jsonl.path().to_path_buf(),
+        "/Users/test/Projects/test-project",
+        TEST_PID,
+        TEST_CPU_USAGE,
+        AgentType::Claude,
+    );
 
     assert!(session.is_some());
     let session = session.unwrap();
     // Since the tempfile was just created, file_recently_modified = true
     // With tool_result + recently modified = Thinking
-    assert!(matches!(session.status, SessionStatus::Thinking),
-        "Expected Thinking when last message is tool_result with recently modified file, got {:?}", session.status);
+    assert!(
+        matches!(session.status, SessionStatus::Thinking),
+        "Expected Thinking when last message is tool_result with recently modified file, got {:?}",
+        session.status
+    );
 }
 
 #[test]
@@ -580,12 +633,21 @@ fn test_parse_jsonl_local_command_is_waiting() {
         r#"{"sessionId":"test-session","type":"user","message":{"role":"user","content":"/clear"},"timestamp":"2024-01-01T00:00:01Z"}"#,
     ]);
 
-    let session = parse_session_file(&jsonl.path().to_path_buf(), "/Users/test/Projects/test-project", TEST_PID, TEST_CPU_USAGE, AgentType::Claude);
+    let session = parse_session_file(
+        &jsonl.path().to_path_buf(),
+        "/Users/test/Projects/test-project",
+        TEST_PID,
+        TEST_CPU_USAGE,
+        AgentType::Claude,
+    );
 
     assert!(session.is_some());
     let session = session.unwrap();
-    assert!(matches!(session.status, SessionStatus::Waiting),
-        "Expected Waiting when last message is local command, got {:?}", session.status);
+    assert!(
+        matches!(session.status, SessionStatus::Waiting),
+        "Expected Waiting when last message is local command, got {:?}",
+        session.status
+    );
 }
 
 #[test]
@@ -600,12 +662,21 @@ fn test_parse_jsonl_complex_conversation_flow() {
         r#"{"sessionId":"test-session","type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"I found 2 files: file1.txt and file2.txt"}]},"timestamp":"2024-01-01T00:00:03Z"}"#,
     ]);
 
-    let session = parse_session_file(&jsonl.path().to_path_buf(), "/Users/test/Projects/test-project", TEST_PID, TEST_CPU_USAGE, AgentType::Claude);
+    let session = parse_session_file(
+        &jsonl.path().to_path_buf(),
+        "/Users/test/Projects/test-project",
+        TEST_PID,
+        TEST_CPU_USAGE,
+        AgentType::Claude,
+    );
 
     assert!(session.is_some());
     let session = session.unwrap();
-    assert!(matches!(session.status, SessionStatus::Waiting),
-        "Expected Waiting after Claude responds with text, got {:?}", session.status);
+    assert!(
+        matches!(session.status, SessionStatus::Waiting),
+        "Expected Waiting after Claude responds with text, got {:?}",
+        session.status
+    );
 }
 
 #[test]
@@ -617,12 +688,21 @@ fn test_parse_jsonl_multiple_tool_calls_in_progress() {
         r#"{"sessionId":"test-session","type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"I'll run the tests first"},{"type":"tool_use","id":"tool1","name":"Bash","input":{"command":"npm test"}}]},"timestamp":"2024-01-01T00:00:01Z"}"#,
     ]);
 
-    let session = parse_session_file(&jsonl.path().to_path_buf(), "/Users/test/Projects/test-project", TEST_PID, TEST_CPU_USAGE, AgentType::Claude);
+    let session = parse_session_file(
+        &jsonl.path().to_path_buf(),
+        "/Users/test/Projects/test-project",
+        TEST_PID,
+        TEST_CPU_USAGE,
+        AgentType::Claude,
+    );
 
     assert!(session.is_some());
     let session = session.unwrap();
-    assert!(matches!(session.status, SessionStatus::Processing),
-        "Expected Processing when tool is executing, got {:?}", session.status);
+    assert!(
+        matches!(session.status, SessionStatus::Processing),
+        "Expected Processing when tool is executing, got {:?}",
+        session.status
+    );
 }
 
 #[test]
@@ -635,13 +715,22 @@ fn test_parse_jsonl_empty_content_skipped() {
         r#"{"sessionId":"test-session","type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Hi there!"}]},"timestamp":"2024-01-01T00:00:02Z"}"#,
     ]);
 
-    let session = parse_session_file(&jsonl.path().to_path_buf(), "/Users/test/Projects/test-project", TEST_PID, TEST_CPU_USAGE, AgentType::Claude);
+    let session = parse_session_file(
+        &jsonl.path().to_path_buf(),
+        "/Users/test/Projects/test-project",
+        TEST_PID,
+        TEST_CPU_USAGE,
+        AgentType::Claude,
+    );
 
     assert!(session.is_some());
     let session = session.unwrap();
     // The parser reads from the end, so it should find the last non-empty message
-    assert!(matches!(session.status, SessionStatus::Waiting),
-        "Expected Waiting after finding text-only assistant message, got {:?}", session.status);
+    assert!(
+        matches!(session.status, SessionStatus::Waiting),
+        "Expected Waiting after finding text-only assistant message, got {:?}",
+        session.status
+    );
 }
 
 // Tests for PREVIOUS_STATUS cleanup
@@ -659,8 +748,20 @@ fn test_cleanup_stale_status_entries_removes_old_sessions() {
     ]);
 
     // Parse both to populate PREVIOUS_STATUS
-    let _ = parse_session_file(&jsonl1.path().to_path_buf(), "/Users/test/Projects/test1", TEST_PID, TEST_CPU_USAGE, AgentType::Claude);
-    let _ = parse_session_file(&jsonl2.path().to_path_buf(), "/Users/test/Projects/test2", TEST_PID, TEST_CPU_USAGE, AgentType::Claude);
+    let _ = parse_session_file(
+        &jsonl1.path().to_path_buf(),
+        "/Users/test/Projects/test1",
+        TEST_PID,
+        TEST_CPU_USAGE,
+        AgentType::Claude,
+    );
+    let _ = parse_session_file(
+        &jsonl2.path().to_path_buf(),
+        "/Users/test/Projects/test2",
+        TEST_PID,
+        TEST_CPU_USAGE,
+        AgentType::Claude,
+    );
 
     // Now cleanup with only session-alive as active
     let mut active_ids = HashSet::new();
@@ -669,7 +770,13 @@ fn test_cleanup_stale_status_entries_removes_old_sessions() {
 
     // Parse session-alive again - it should not cause a "STATUS TRANSITION" log
     // since its entry was preserved. This verifies cleanup kept it.
-    let session = parse_session_file(&jsonl1.path().to_path_buf(), "/Users/test/Projects/test1", TEST_PID, TEST_CPU_USAGE, AgentType::Claude);
+    let session = parse_session_file(
+        &jsonl1.path().to_path_buf(),
+        "/Users/test/Projects/test1",
+        TEST_PID,
+        TEST_CPU_USAGE,
+        AgentType::Claude,
+    );
     assert!(session.is_some());
     assert_eq!(session.unwrap().id, "session-alive");
 }
@@ -708,8 +815,13 @@ fn test_get_sessions_internal_process_with_nonexistent_project_is_skipped() {
     let processes = vec![AgentProcess {
         pid: 99999,
         cpu_usage: 0.0,
-        cwd: Some(std::path::PathBuf::from("/nonexistent/path/that/does/not/match/any/project")),
+        cwd: Some(std::path::PathBuf::from(
+            "/nonexistent/path/that/does/not/match/any/project",
+        )),
     }];
     let sessions = get_sessions_internal(&processes, AgentType::Claude);
-    assert!(sessions.is_empty(), "Process with non-matching CWD should produce no sessions");
+    assert!(
+        sessions.is_empty(),
+        "Process with non-matching CWD should produce no sessions"
+    );
 }

@@ -1,7 +1,11 @@
+pub mod amp;
 pub mod claude;
+pub mod claude_style;
+pub mod codex;
 pub mod opencode;
+pub mod process;
 
-use crate::session::{Session, SessionsResponse, AgentType};
+use crate::session::{AgentType, Session, SessionsResponse};
 use std::sync::Mutex;
 use sysinfo::{ProcessRefreshKind, RefreshKind, System};
 
@@ -35,12 +39,26 @@ pub trait AgentDetector: Send + Sync {
 
 /// Get all sessions from all registered agent detectors
 pub fn get_all_sessions() -> SessionsResponse {
+    use crate::session::{cleanup_stale_status_entries, status_sort_priority};
     use std::collections::HashSet;
-    use crate::session::{status_sort_priority, cleanup_stale_status_entries};
 
     let detectors: Vec<Box<dyn AgentDetector>> = vec![
         Box::new(claude::ClaudeDetector),
         Box::new(opencode::OpenCodeDetector),
+        Box::new(codex::CodexDetector),
+        Box::new(amp::AmpDetector),
+        Box::new(claude_style::JsonlAgentDetector {
+            display_name: "Pi",
+            agent_type: AgentType::Pi,
+            process_names: &["pi"],
+            projects_dir: claude_style::pi_projects_dir,
+        }),
+        Box::new(claude_style::JsonlAgentDetector {
+            display_name: "Droid",
+            agent_type: AgentType::Droid,
+            process_names: &["droid"],
+            projects_dir: claude_style::droid_projects_dir,
+        }),
     ];
 
     // Phase 1: Refresh shared system once, discover all processes
@@ -54,8 +72,8 @@ pub fn get_all_sessions() -> SessionsResponse {
                         .with_cmd(sysinfo::UpdateKind::Always)
                         .with_cwd(sysinfo::UpdateKind::Always)
                         .with_cpu()
-                        .with_memory()
-                )
+                        .with_memory(),
+                ),
             )
         });
         system.refresh_processes_specifics(
@@ -64,7 +82,7 @@ pub fn get_all_sessions() -> SessionsResponse {
                 .with_cmd(sysinfo::UpdateKind::Always)
                 .with_cwd(sysinfo::UpdateKind::Always)
                 .with_cpu()
-                .with_memory()
+                .with_memory(),
         );
 
         detectors.iter().map(|d| d.find_processes(system)).collect()
@@ -74,8 +92,12 @@ pub fn get_all_sessions() -> SessionsResponse {
     let mut all_sessions = Vec::new();
     for (detector, processes) in detectors.iter().zip(all_processes.iter()) {
         let sessions = detector.find_sessions(processes);
-        log::info!("{}: found {} processes, {} sessions",
-            detector.name(), processes.len(), sessions.len());
+        log::info!(
+            "{}: found {} processes, {} sessions",
+            detector.name(),
+            processes.len(),
+            sessions.len()
+        );
         all_sessions.extend(sessions);
     }
 
@@ -95,7 +117,8 @@ pub fn get_all_sessions() -> SessionsResponse {
         }
     });
 
-    let waiting_count = all_sessions.iter()
+    let waiting_count = all_sessions
+        .iter()
         .filter(|s| matches!(s.status, crate::session::SessionStatus::Waiting))
         .count();
     let total_count = all_sessions.len();

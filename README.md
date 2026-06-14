@@ -13,6 +13,10 @@ A macOS desktop app to monitor your AI coding agents in real-time.
 
 - **Claude Code** - Anthropic's official CLI for Claude
 - **OpenCode** - Open-source AI coding assistant
+- **Codex** - OpenAI Codex CLI sessions
+- **Amp** - Sourcegraph Amp CLI sessions
+- **Pi** - Pi agent sessions
+- **Droid** - Factory Droid sessions from `~/.factory/sessions`
 
 ## Features
 

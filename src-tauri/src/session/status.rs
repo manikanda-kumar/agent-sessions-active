@@ -21,7 +21,8 @@ pub fn is_waiting_for_user_input(content: &serde_json::Value) -> bool {
     let user_input_tools = ["AskUserQuestion"];
 
     if let serde_json::Value::Array(arr) = content {
-        let tool_use_blocks: Vec<_> = arr.iter()
+        let tool_use_blocks: Vec<_> = arr
+            .iter()
             .filter(|item| {
                 item.get("type")
                     .and_then(|t| t.as_str())
@@ -30,12 +31,13 @@ pub fn is_waiting_for_user_input(content: &serde_json::Value) -> bool {
             })
             .collect();
 
-        !tool_use_blocks.is_empty() && tool_use_blocks.iter().all(|item| {
-            item.get("name")
-                .and_then(|n| n.as_str())
-                .map(|name| user_input_tools.contains(&name))
-                .unwrap_or(false) // unnamed tool_use -> not a user-input tool
-        })
+        !tool_use_blocks.is_empty()
+            && tool_use_blocks.iter().all(|item| {
+                item.get("name")
+                    .and_then(|n| n.as_str())
+                    .map(|name| user_input_tools.contains(&name))
+                    .unwrap_or(false) // unnamed tool_use -> not a user-input tool
+            })
     } else {
         false
     }
@@ -61,9 +63,9 @@ fn extract_text_content(content: &serde_json::Value) -> &str {
         serde_json::Value::String(s) => s.as_str(),
         serde_json::Value::Array(arr) => {
             // Find first text block
-            arr.iter().find_map(|v| {
-                v.get("text").and_then(|t| t.as_str())
-            }).unwrap_or("")
+            arr.iter()
+                .find_map(|v| v.get("text").and_then(|t| t.as_str()))
+                .unwrap_or("")
         }
         _ => "",
     }
@@ -104,9 +106,10 @@ pub fn is_local_slash_command(content: &serde_json::Value) -> bool {
     ];
 
     // Check direct command format (e.g., "/clear")
-    if local_commands.iter().any(|cmd| {
-        trimmed == *cmd || trimmed.starts_with(&format!("{} ", cmd))
-    }) {
+    if local_commands
+        .iter()
+        .any(|cmd| trimmed == *cmd || trimmed.starts_with(&format!("{} ", cmd)))
+    {
         return true;
     }
 
@@ -115,9 +118,9 @@ pub fn is_local_slash_command(content: &serde_json::Value) -> bool {
         let after_tag = &trimmed[start + "<command-name>".len()..];
         if let Some(end) = after_tag.find("</command-name>") {
             let cmd_name = after_tag[..end].trim();
-            return local_commands.iter().any(|cmd| {
-                cmd_name == *cmd || cmd_name.starts_with(&format!("{} ", cmd))
-            });
+            return local_commands
+                .iter()
+                .any(|cmd| cmd_name == *cmd || cmd_name.starts_with(&format!("{} ", cmd)));
         }
     }
 
@@ -128,11 +131,11 @@ pub fn is_local_slash_command(content: &serde_json::Value) -> bool {
 /// Active sessions (thinking/processing) appear first, then waiting, then idle
 pub fn status_sort_priority(status: &SessionStatus) -> u8 {
     match status {
-        SessionStatus::Thinking => 0,    // Active - Claude is working - show first
-        SessionStatus::Processing => 0,  // Active - tool is running - show first
-        SessionStatus::Compacting => 0,  // Active - compressing context - show first
-        SessionStatus::Waiting => 1,     // Needs attention - show second
-        SessionStatus::Idle => 2,        // Inactive - show last
+        SessionStatus::Thinking => 0, // Active - Claude is working - show first
+        SessionStatus::Processing => 0, // Active - tool is running - show first
+        SessionStatus::Compacting => 0, // Active - compressing context - show first
+        SessionStatus::Waiting => 1,  // Needs attention - show second
+        SessionStatus::Idle => 2,     // Inactive - show last
     }
 }
 
