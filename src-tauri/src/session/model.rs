@@ -10,6 +10,8 @@ pub enum AgentType {
     Amp,
     Pi,
     Droid,
+    Agy,
+    Grok,
 }
 
 /// Represents a Claude Code session

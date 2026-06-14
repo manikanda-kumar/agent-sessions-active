@@ -2,10 +2,9 @@ use super::{process::find_agent_processes, AgentDetector, AgentProcess};
 use crate::session::{AgentType, Session, SessionStatus};
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::path::Path;
 
 pub struct AmpDetector;
 
@@ -27,41 +26,75 @@ impl AgentDetector for AmpDetector {
     }
 }
 
+// ─── Plugin status file (authoritative) ────────────────────────────────────
+// The `agent-sessions-status` Amp plugin runs inside each amp process and
+// writes ~/.local/share/amp/agent-sessions/<pid>.json with the exact thread id,
+// cwd, and live turn status. Joined to a process by pid, this needs no
+// guessing. When the plugin isn't installed we fall back to the session.json /
+// history.jsonl heuristic below.
+
+#[derive(Debug, Deserialize)]
+struct AmpPluginStatus {
+    #[serde(rename = "threadId")]
+    thread_id: Option<String>,
+    status: Option<String>,
+    #[serde(rename = "updatedAt")]
+    updated_at: Option<u64>,
+}
+
+// ─── session.json ──────────────────────────────────────────────────────────
+// Amp stores threads server-side now; the local `threads/*.json` files are
+// stale snapshots and no longer track the active session. The authoritative
+// local signal for "which thread is this process on, and when was it last
+// touched" lives in `session.json` (`lastThreadId` / `lastThreadByTerminal`).
+
+#[derive(Debug, Deserialize, Default)]
+struct AmpSessionState {
+    #[serde(rename = "lastThreadId")]
+    last_thread_id: Option<String>,
+    #[serde(rename = "lastThreadByTerminal", default)]
+    last_thread_by_terminal: HashMap<String, AmpTerminalThread>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AmpTerminalThread {
+    #[serde(rename = "updatedAt")]
+    updated_at: u64,
+    #[serde(rename = "lastThreadId")]
+    last_thread_id: String,
+}
+
+/// One active thread: id + last-touched time, sorted most-recent-first.
+struct RecentThread {
+    thread_id: String,
+    updated_at: u64,
+}
+
+// ─── history.jsonl ─────────────────────────────────────────────────────────
+// Append-only log of submitted prompts: `{ "text": ..., "cwd": ... }`, one per
+// line, oldest first. `cwd` is the only local join key back to a process.
+
+#[derive(Debug, Deserialize)]
+struct AmpHistoryEntry {
+    text: Option<String>,
+    cwd: Option<String>,
+}
+
+// ─── Optional local thread file (back-compat / enrichment) ──────────────────
+
 #[derive(Debug, Deserialize)]
 struct AmpThread {
+    #[allow(dead_code)]
     id: String,
-    created: Option<u64>,
     title: Option<String>,
+    #[serde(default)]
     messages: Vec<AmpMessage>,
-    env: Option<AmpEnvironment>,
-}
-
-#[derive(Debug, Deserialize)]
-struct AmpEnvironment {
-    initial: Option<AmpInitialEnvironment>,
-}
-
-#[derive(Debug, Deserialize)]
-struct AmpInitialEnvironment {
-    trees: Option<Vec<AmpWorkspaceTree>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct AmpWorkspaceTree {
-    uri: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct AmpMessage {
     role: String,
     content: Value,
-    meta: Option<AmpMeta>,
-}
-
-#[derive(Debug, Deserialize)]
-struct AmpMeta {
-    #[serde(rename = "sentAt")]
-    sent_at: Option<u64>,
 }
 
 fn get_amp_sessions(processes: &[AgentProcess]) -> Vec<Session> {
@@ -69,196 +102,251 @@ fn get_amp_sessions(processes: &[AgentProcess]) -> Vec<Session> {
         return Vec::new();
     }
 
-    let Some(threads_dir) = dirs::home_dir().map(|home| {
-        home.join(".local")
-            .join("share")
-            .join("amp")
-            .join("threads")
-    }) else {
+    let Some(amp_dir) = dirs::home_dir()
+        .map(|home| home.join(".local").join("share").join("amp"))
+    else {
         return Vec::new();
     };
-    if !threads_dir.exists() {
-        return Vec::new();
-    }
 
-    let candidates = collect_thread_candidates(&threads_dir);
-    let mut used_threads: HashSet<String> = HashSet::new();
-    processes
+    let state = read_session_state(&amp_dir);
+    let history = read_history(&amp_dir);
+
+    // 1. Authoritative: per-pid status written by the amp plugin.
+    let plugin_by_pid: HashMap<u32, AmpPluginStatus> = processes
         .iter()
         .filter_map(|process| {
-            let thread_path = matching_thread(&candidates, process, &used_threads)
-                .or_else(|| latest_unused_thread(&candidates, &used_threads))?;
-            let thread_id = thread_path
-                .file_stem()
-                .and_then(|name| name.to_str())
-                .unwrap_or_default()
-                .to_string();
-            used_threads.insert(thread_id);
-            parse_amp_session(&thread_path, process)
+            read_plugin_status(&amp_dir, process.pid).map(|status| (process.pid, status))
+        })
+        .collect();
+
+    // Threads already pinned to a process by the plugin must not be reused by
+    // the recency heuristic for the remaining processes.
+    let claimed: HashSet<String> = plugin_by_pid
+        .values()
+        .filter_map(|status| status.thread_id.clone())
+        .collect();
+
+    // 2. Fallback: pair the processes with no plugin data against the most
+    // recent unclaimed threads from session.json. Rank each process by how
+    // recently its cwd appears in history.jsonl; cwd is the join key to the
+    // process, thread updatedAt to the (cloud) thread. Recency aligns the two.
+    let fallback_threads: Vec<RecentThread> = recent_threads(&state)
+        .into_iter()
+        .filter(|thread| !claimed.contains(&thread.thread_id))
+        .collect();
+
+    let mut ranked: Vec<&AgentProcess> = processes
+        .iter()
+        .filter(|process| !plugin_by_pid.contains_key(&process.pid))
+        .collect();
+    ranked.sort_by(|a, b| history_rank(&history, b).cmp(&history_rank(&history, a)));
+
+    let fallback_by_pid: HashMap<u32, &RecentThread> = ranked
+        .iter()
+        .enumerate()
+        .filter_map(|(index, process)| fallback_threads.get(index).map(|thread| (process.pid, thread)))
+        .collect();
+
+    processes
+        .iter()
+        .map(|process| {
+            let plugin = plugin_by_pid.get(&process.pid);
+            let recent = fallback_by_pid.get(&process.pid).copied();
+            build_session(&amp_dir, process, plugin, recent, &history)
         })
         .collect()
 }
 
-struct AmpThreadCandidate {
-    path: PathBuf,
-    modified: SystemTime,
-    workspace_paths: Vec<String>,
+fn read_plugin_status(amp_dir: &Path, pid: u32) -> Option<AmpPluginStatus> {
+    let path = amp_dir
+        .join("agent-sessions")
+        .join(format!("{}.json", pid));
+    let content = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&content).ok()
 }
 
-fn collect_thread_candidates(threads_dir: &Path) -> Vec<AmpThreadCandidate> {
-    let mut candidates = Vec::new();
-    let Ok(entries) = fs::read_dir(threads_dir) else {
-        return candidates;
-    };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.extension().map(|ext| ext == "json").unwrap_or(false) {
-            continue;
-        }
-        let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
-            continue;
-        };
-        let workspace_paths = read_amp_workspace_paths(&path);
-        candidates.push(AmpThreadCandidate {
-            path,
-            modified,
-            workspace_paths,
-        });
-    }
-    candidates.sort_by(|a, b| b.modified.cmp(&a.modified));
-    candidates
-}
-
-fn matching_thread(
-    candidates: &[AmpThreadCandidate],
-    process: &AgentProcess,
-    used_threads: &HashSet<String>,
-) -> Option<PathBuf> {
-    let cwd = process.cwd.as_ref()?.to_string_lossy().to_string();
-    candidates
-        .iter()
-        .find(|candidate| {
-            !is_used_thread(&candidate.path, used_threads)
-                && candidate.workspace_paths.iter().any(|path| path == &cwd)
-        })
-        .map(|candidate| candidate.path.clone())
-}
-
-fn latest_unused_thread(
-    candidates: &[AmpThreadCandidate],
-    used_threads: &HashSet<String>,
-) -> Option<PathBuf> {
-    candidates
-        .iter()
-        .find(|candidate| !is_used_thread(&candidate.path, used_threads))
-        .map(|candidate| candidate.path.clone())
-}
-
-fn is_used_thread(path: &Path, used_threads: &HashSet<String>) -> bool {
-    path.file_stem()
-        .and_then(|name| name.to_str())
-        .map(|stem| used_threads.contains(stem))
-        .unwrap_or(false)
-}
-
-fn read_amp_workspace_paths(path: &Path) -> Vec<String> {
-    let Ok(content) = fs::read_to_string(path) else {
-        return Vec::new();
-    };
-    let Ok(thread) = serde_json::from_str::<AmpThread>(&content) else {
-        return Vec::new();
-    };
-    amp_workspace_paths(&thread)
-}
-
-fn amp_workspace_paths(thread: &AmpThread) -> Vec<String> {
-    thread
-        .env
-        .as_ref()
-        .and_then(|env| env.initial.as_ref())
-        .and_then(|initial| initial.trees.as_ref())
-        .map(|trees| {
-            trees
-                .iter()
-                .filter_map(|tree| tree.uri.as_deref())
-                .filter_map(file_uri_to_path)
-                .collect()
-        })
+fn read_session_state(amp_dir: &Path) -> AmpSessionState {
+    fs::read_to_string(amp_dir.join("session.json"))
+        .ok()
+        .and_then(|content| serde_json::from_str(&content).ok())
         .unwrap_or_default()
 }
 
-fn file_uri_to_path(uri: &str) -> Option<String> {
-    let path = uri.strip_prefix("file://")?;
-    percent_decode(path)
-}
+/// Active threads sorted most-recently-updated first, deduplicated by id.
+fn recent_threads(state: &AmpSessionState) -> Vec<RecentThread> {
+    let mut threads: Vec<RecentThread> = state
+        .last_thread_by_terminal
+        .values()
+        .map(|terminal| RecentThread {
+            thread_id: terminal.last_thread_id.clone(),
+            updated_at: terminal.updated_at,
+        })
+        .collect();
+    threads.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    threads.dedup_by(|a, b| a.thread_id == b.thread_id);
 
-fn percent_decode(value: &str) -> Option<String> {
-    let bytes = value.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%' {
-            if index + 2 >= bytes.len() {
-                return None;
-            }
-            let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).ok()?;
-            decoded.push(u8::from_str_radix(hex, 16).ok()?);
-            index += 3;
-        } else {
-            decoded.push(bytes[index]);
-            index += 1;
+    // Guarantee the single most-recent thread is represented even if the
+    // per-terminal map is empty (older Amp builds).
+    if let Some(last_id) = &state.last_thread_id {
+        if !threads.iter().any(|thread| &thread.thread_id == last_id) {
+            threads.insert(
+                0,
+                RecentThread {
+                    thread_id: last_id.clone(),
+                    updated_at: 0,
+                },
+            );
         }
     }
-    String::from_utf8(decoded).ok()
+    threads
 }
 
-fn parse_amp_session(path: &Path, process: &AgentProcess) -> Option<Session> {
-    let content = fs::read_to_string(path).ok()?;
-    let thread: AmpThread = serde_json::from_str(&content).ok()?;
-    let cwd = process.cwd.as_ref()?.to_string_lossy().to_string();
-    let project_name = cwd
+fn read_history(amp_dir: &Path) -> Vec<AmpHistoryEntry> {
+    let Ok(content) = fs::read_to_string(amp_dir.join("history.jsonl")) else {
+        return Vec::new();
+    };
+    content
+        .lines()
+        .filter_map(|line| serde_json::from_str::<AmpHistoryEntry>(line).ok())
+        .collect()
+}
+
+/// Highest line index in history whose cwd matches the process (0 = no match).
+fn history_rank(history: &[AmpHistoryEntry], process: &AgentProcess) -> usize {
+    let Some(cwd) = process_cwd(process) else {
+        return 0;
+    };
+    history
+        .iter()
+        .rposition(|entry| entry.cwd.as_deref() == Some(cwd.as_str()))
+        .map(|pos| pos + 1)
+        .unwrap_or(0)
+}
+
+/// Last prompt text submitted from the process cwd.
+fn last_prompt_for_cwd(history: &[AmpHistoryEntry], cwd: &str) -> Option<String> {
+    history
+        .iter()
+        .rev()
+        .find(|entry| entry.cwd.as_deref() == Some(cwd))
+        .and_then(|entry| entry.text.clone())
+        .filter(|text| !text.is_empty())
+}
+
+fn build_session(
+    amp_dir: &Path,
+    process: &AgentProcess,
+    plugin: Option<&AmpPluginStatus>,
+    recent: Option<&RecentThread>,
+    history: &[AmpHistoryEntry],
+) -> Session {
+    let cwd = process_cwd(process).unwrap_or_default();
+    let fallback_name = cwd
         .split('/')
         .filter(|part| !part.is_empty())
         .last()
         .unwrap_or("Unknown")
         .to_string();
 
+    // Thread id: plugin is authoritative; else the recency-matched thread.
+    let thread_id = plugin
+        .and_then(|plugin| plugin.thread_id.clone())
+        .or_else(|| recent.map(|recent| recent.thread_id.clone()));
+
+    // Enrich from a local thread file when it still exists (older Amp builds
+    // that store threads on disk). Cloud-only threads have no local file.
+    let thread = thread_id
+        .as_ref()
+        .map(|id| amp_dir.join("threads").join(format!("{}.json", id)))
+        .filter(|path| path.exists())
+        .and_then(|path| read_thread(&path));
+
+    let last_role = thread.as_ref().and_then(|thread| {
+        thread
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.role == "user" || message.role == "assistant")
+            .map(|message| message.role.clone())
+    });
+
     let last_message = thread
-        .messages
-        .iter()
-        .rev()
-        .find(|message| message.role == "user" || message.role == "assistant");
-    let last_role = last_message.map(|message| message.role.clone());
-    let last_text = last_message.and_then(|message| extract_amp_text(&message.content));
-    let last_activity_at = last_message
-        .and_then(|message| message.meta.as_ref().and_then(|meta| meta.sent_at))
-        .or(thread.created)
+        .as_ref()
+        .and_then(last_thread_text)
+        .or_else(|| last_prompt_for_cwd(history, &cwd))
+        .map(truncate);
+
+    let project_name = thread
+        .as_ref()
+        .and_then(|thread| thread.title.clone())
+        .filter(|title| !title.is_empty())
+        .unwrap_or(fallback_name);
+
+    // Timestamp: plugin updatedAt, else session.json updatedAt, else now.
+    let last_activity_at = plugin
+        .and_then(|plugin| plugin.updated_at)
+        .filter(|ts| *ts > 0)
+        .or_else(|| recent.map(|recent| recent.updated_at).filter(|ts| *ts > 0))
         .and_then(millis_to_iso)
+        .or_else(|| millis_to_iso(now_millis()))
         .unwrap_or_else(|| "Unknown".to_string());
 
-    let status = match last_role.as_deref() {
-        Some("assistant") => SessionStatus::Waiting,
-        Some("user") => SessionStatus::Processing,
-        _ if process.cpu_usage > 5.0 => SessionStatus::Processing,
-        _ => SessionStatus::Idle,
-    };
+    // Status: plugin's live turn status wins; else infer from messages/cpu.
+    let status = plugin
+        .and_then(|plugin| plugin.status.as_deref())
+        .map(plugin_status_to_session_status)
+        .unwrap_or_else(|| match last_role.as_deref() {
+            Some("assistant") => SessionStatus::Waiting,
+            Some("user") => SessionStatus::Processing,
+            _ if process.cpu_usage > 5.0 => SessionStatus::Processing,
+            _ => SessionStatus::Idle,
+        });
 
-    Some(Session {
-        id: thread.id,
+    Session {
+        id: thread_id.unwrap_or_else(|| format!("amp-{}", process.pid)),
         agent_type: AgentType::Amp,
-        project_name: thread.title.unwrap_or(project_name),
+        project_name,
         project_path: cwd,
         git_branch: None,
         github_url: None,
         status,
-        last_message: last_text.map(truncate),
+        last_message,
         last_message_role: last_role,
         last_activity_at,
         pid: process.pid,
         cpu_usage: process.cpu_usage,
         active_subagent_count: 0,
-    })
+    }
+}
+
+fn plugin_status_to_session_status(status: &str) -> SessionStatus {
+    match status {
+        "thinking" => SessionStatus::Thinking,
+        "processing" => SessionStatus::Processing,
+        "waiting" => SessionStatus::Waiting,
+        _ => SessionStatus::Idle,
+    }
+}
+
+fn process_cwd(process: &AgentProcess) -> Option<String> {
+    process
+        .cwd
+        .as_ref()
+        .map(|path| path.to_string_lossy().to_string())
+}
+
+fn read_thread(path: &Path) -> Option<AmpThread> {
+    let content = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+fn last_thread_text(thread: &AmpThread) -> Option<String> {
+    thread
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user" || message.role == "assistant")
+        .and_then(|message| extract_amp_text(&message.content))
 }
 
 fn extract_amp_text(content: &Value) -> Option<String> {
@@ -272,6 +360,13 @@ fn extract_amp_text(content: &Value) -> Option<String> {
         }),
         _ => None,
     }
+}
+
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn millis_to_iso(timestamp: u64) -> Option<String> {
@@ -293,30 +388,55 @@ mod tests {
     use super::*;
 
     #[test]
-    fn extracts_amp_workspace_paths_from_env_tree_uris() {
-        let thread: AmpThread = serde_json::from_str(
+    fn recent_threads_sorted_by_updated_at_desc() {
+        let state: AmpSessionState = serde_json::from_str(
             r#"{
-                "id": "T-test",
-                "created": 1710000000000,
-                "title": "Example",
-                "messages": [],
-                "env": {
-                    "initial": {
-                        "trees": [
-                            {
-                                "displayName": "repo",
-                                "uri": "file:///Users/test/Github/repo%20with%20spaces"
-                            }
-                        ]
-                    }
+                "lastThreadId": "T-new",
+                "lastThreadByTerminal": {
+                    "term-a": { "updatedAt": 100, "lastThreadId": "T-old" },
+                    "term-b": { "updatedAt": 300, "lastThreadId": "T-new" },
+                    "term-c": { "updatedAt": 200, "lastThreadId": "T-mid" }
                 }
             }"#,
         )
         .unwrap();
 
-        assert_eq!(
-            amp_workspace_paths(&thread),
-            vec!["/Users/test/Github/repo with spaces".to_string()]
-        );
+        let threads = recent_threads(&state);
+        let ids: Vec<&str> = threads.iter().map(|t| t.thread_id.as_str()).collect();
+        assert_eq!(ids, vec!["T-new", "T-mid", "T-old"]);
+        assert_eq!(threads[0].updated_at, 300);
+    }
+
+    #[test]
+    fn last_thread_id_included_when_terminal_map_empty() {
+        let state: AmpSessionState = serde_json::from_str(
+            r#"{ "lastThreadId": "T-solo", "lastThreadByTerminal": {} }"#,
+        )
+        .unwrap();
+
+        let threads = recent_threads(&state);
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0].thread_id, "T-solo");
+    }
+
+    #[test]
+    fn last_prompt_matches_by_cwd() {
+        let history = vec![
+            AmpHistoryEntry {
+                text: Some("first".into()),
+                cwd: Some("/a".into()),
+            },
+            AmpHistoryEntry {
+                text: Some("second".into()),
+                cwd: Some("/b".into()),
+            },
+            AmpHistoryEntry {
+                text: Some("third".into()),
+                cwd: Some("/a".into()),
+            },
+        ];
+        assert_eq!(last_prompt_for_cwd(&history, "/a").as_deref(), Some("third"));
+        assert_eq!(last_prompt_for_cwd(&history, "/b").as_deref(), Some("second"));
+        assert_eq!(last_prompt_for_cwd(&history, "/c"), None);
     }
 }

@@ -1,7 +1,9 @@
+pub mod agy;
 pub mod amp;
 pub mod claude;
 pub mod claude_style;
 pub mod codex;
+pub mod grok;
 pub mod opencode;
 pub mod process;
 
@@ -47,6 +49,8 @@ pub fn get_all_sessions() -> SessionsResponse {
         Box::new(opencode::OpenCodeDetector),
         Box::new(codex::CodexDetector),
         Box::new(amp::AmpDetector),
+        Box::new(agy::AgyDetector),
+        Box::new(grok::GrokDetector),
         Box::new(claude_style::JsonlAgentDetector {
             display_name: "Pi",
             agent_type: AgentType::Pi,
