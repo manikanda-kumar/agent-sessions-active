@@ -49,47 +49,92 @@ fn get_codex_sessions(processes: &[AgentProcess]) -> Vec<Session> {
         return Vec::new();
     }
 
-    let Some(sessions_dir) = dirs::home_dir().map(|home| home.join(".codex").join("sessions"))
-    else {
+    let Some(codex_dir) = dirs::home_dir().map(|home| home.join(".codex")) else {
         return Vec::new();
     };
+    let sessions_dir = codex_dir.join("sessions");
     if !sessions_dir.exists() {
         return Vec::new();
     }
 
-    let cwd_to_process: HashMap<String, &AgentProcess> = processes
-        .iter()
-        .filter_map(|process| {
-            process
-                .cwd
-                .as_ref()
-                .map(|cwd| (cwd.to_string_lossy().to_string(), process))
-        })
-        .collect();
+    // Codex is now an Electron app (`codex app-server`) whose processes run with
+    // cwd `/`, which is not a real workspace — matching `/` surfaces ancient
+    // sessions that happened to launch from `/`. So we ignore root-cwd sessions
+    // entirely. A terminal TUI process keeps its own concrete cwd and matches
+    // sessions directly. For the app-server (cwd `/`), there is no per-process
+    // workspace, so we attribute the single most-recently-active codex session
+    // to it (gated by recency, so an idle app shows nothing stale).
+    let mut cwd_to_process: HashMap<String, &AgentProcess> = HashMap::new();
+    let mut app_process: Option<&AgentProcess> = None;
+    for process in processes {
+        match process.cwd.as_ref().map(|cwd| cwd.to_string_lossy().to_string()) {
+            Some(cwd) if cwd != "/" => {
+                cwd_to_process.entry(cwd).or_insert(process);
+            }
+            // cwd `/` or missing -> app-server; remember one as the carrier.
+            _ => app_process = app_process.or(Some(process)),
+        }
+    }
 
     let mut latest_by_cwd: HashMap<String, (PathBuf, std::time::SystemTime)> = HashMap::new();
+    // Most-recently-modified non-root session overall, for the app-server.
+    let mut newest_overall: Option<(PathBuf, std::time::SystemTime, String)> = None;
     collect_jsonl_files(&sessions_dir, &mut |path, modified| {
-        if let Some(meta) = read_codex_meta(path) {
-            if cwd_to_process.contains_key(&meta.cwd) {
-                let replace = latest_by_cwd
-                    .get(&meta.cwd)
-                    .map(|(_, existing_modified)| modified > *existing_modified)
-                    .unwrap_or(true);
-                if replace {
-                    latest_by_cwd.insert(meta.cwd, (path.to_path_buf(), modified));
-                }
+        let Some(meta) = read_codex_meta(path) else {
+            return;
+        };
+        if meta.cwd == "/" {
+            return;
+        }
+        if cwd_to_process.contains_key(&meta.cwd) {
+            let replace = latest_by_cwd
+                .get(&meta.cwd)
+                .map(|(_, existing_modified)| modified > *existing_modified)
+                .unwrap_or(true);
+            if replace {
+                latest_by_cwd.insert(meta.cwd.clone(), (path.to_path_buf(), modified));
+            }
+        }
+        if app_process.is_some() {
+            let replace = newest_overall
+                .as_ref()
+                .map(|(_, existing, _)| modified > *existing)
+                .unwrap_or(true);
+            if replace {
+                newest_overall = Some((path.to_path_buf(), modified, meta.cwd));
             }
         }
     });
 
-    latest_by_cwd
-        .into_iter()
+    let mut sessions: Vec<Session> = latest_by_cwd
+        .iter()
         .filter_map(|(cwd, (path, _))| {
-            let process = cwd_to_process.get(&cwd)?;
-            parse_codex_session(&path, process)
+            let process = cwd_to_process.get(cwd)?;
+            parse_codex_session(path, process)
         })
-        .collect()
+        .collect();
+
+    // Attribute the latest codex session to the desktop app, if recent enough
+    // and not already shown via a concrete-cwd (TUI) process.
+    if let (Some(app), Some((path, modified, cwd))) = (app_process, newest_overall) {
+        let recent = std::time::SystemTime::now()
+            .duration_since(modified)
+            .map(|age| age < APP_SESSION_RECENCY)
+            .unwrap_or(false);
+        let already_shown = latest_by_cwd.contains_key(&cwd);
+        if recent && !already_shown {
+            if let Some(session) = parse_codex_session(&path, app) {
+                sessions.push(session);
+            }
+        }
+    }
+
+    sessions
 }
+
+/// How recently the latest codex session must have been touched for the desktop
+/// app (cwd `/`) to surface it. Beyond this the app is treated as idle.
+const APP_SESSION_RECENCY: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
 fn collect_jsonl_files(dir: &Path, visit: &mut impl FnMut(&Path, std::time::SystemTime)) {
     let Ok(entries) = fs::read_dir(dir) else {
@@ -232,5 +277,26 @@ fn truncate(text: String) -> String {
         format!("{}...", text.chars().take(100).collect::<String>())
     } else {
         text
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_user_message_from_response_item() {
+        let payload: Value = serde_json::from_str(
+            r#"{"role":"user","content":[{"type":"input_text","text":"hello there"}]}"#,
+        )
+        .unwrap();
+        let (role, text) = extract_codex_message(&payload).unwrap();
+        assert_eq!(role, "user");
+        assert_eq!(text.as_deref(), Some("hello there"));
+    }
+
+    #[test]
+    fn app_session_recency_is_one_day() {
+        assert_eq!(APP_SESSION_RECENCY.as_secs(), 86_400);
     }
 }

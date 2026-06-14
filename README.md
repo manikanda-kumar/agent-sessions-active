@@ -17,6 +17,7 @@ A macOS desktop app to monitor your AI coding agents in real-time.
 - **Amp** - Sourcegraph Amp CLI sessions
 - **Pi** - Pi agent sessions
 - **Droid** - Factory Droid sessions from `~/.factory/sessions`
+- **Agy** - Google Antigravity CLI sessions from `~/.gemini/antigravity-cli`
 
 ## Features
 

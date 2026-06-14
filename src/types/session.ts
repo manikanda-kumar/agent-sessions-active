@@ -1,6 +1,6 @@
 export type SessionStatus = 'waiting' | 'processing' | 'thinking' | 'compacting' | 'idle';
 
-export type AgentType = 'claude' | 'opencode' | 'codex' | 'amp' | 'pi' | 'droid';
+export type AgentType = 'claude' | 'opencode' | 'codex' | 'amp' | 'pi' | 'droid' | 'agy' | 'grok';
 
 export interface Session {
   id: string;

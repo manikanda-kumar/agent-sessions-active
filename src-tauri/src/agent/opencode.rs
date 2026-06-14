@@ -106,20 +106,33 @@ fn find_opencode_processes(system: &sysinfo::System) -> Vec<AgentProcess> {
     processes
 }
 
-/// Get OpenCode sessions from JSON files
+/// Get OpenCode sessions. Modern OpenCode stores everything in a SQLite DB
+/// (`opencode.db`); the JSON `storage/` tree is legacy and goes stale, so we
+/// prefer the DB and only fall back to JSON when the DB is absent/unreadable.
 fn get_opencode_sessions(processes: &[AgentProcess]) -> Vec<Session> {
-    let mut sessions = Vec::new();
-
-    // OpenCode data directory: ~/.local/share/opencode/storage/
-    // Note: OpenCode uses XDG convention, not macOS Application Support
-    let storage_path = match dirs::home_dir() {
-        Some(home) => home
-            .join(".local")
-            .join("share")
-            .join("opencode")
-            .join("storage"),
-        None => return sessions,
+    let data_dir = match dirs::home_dir() {
+        Some(home) => home.join(".local").join("share").join("opencode"),
+        None => return Vec::new(),
     };
+
+    let db_path = data_dir.join("opencode.db");
+    if db_path.exists() {
+        match db::get_sessions_from_db(&db_path, processes) {
+            Ok(sessions) if !sessions.is_empty() => return sessions,
+            Ok(_) => {} // DB present but matched nothing; fall through to JSON
+            Err(err) => log::warn!("OpenCode DB read failed, using JSON fallback: {err}"),
+        }
+    }
+
+    get_opencode_sessions_from_json(&data_dir.join("storage"), processes)
+}
+
+/// Legacy: parse OpenCode sessions from the JSON `storage/` tree.
+fn get_opencode_sessions_from_json(
+    storage_path: &PathBuf,
+    processes: &[AgentProcess],
+) -> Vec<Session> {
+    let mut sessions = Vec::new();
 
     if !storage_path.exists() {
         log::debug!(
@@ -138,7 +151,7 @@ fn get_opencode_sessions(processes: &[AgentProcess]) -> Vec<Session> {
     }
 
     // Load all projects
-    let projects = load_projects(&storage_path);
+    let projects = load_projects(storage_path);
     log::debug!("Loaded {} OpenCode projects", projects.len());
 
     // Track which processes have been matched
@@ -177,7 +190,7 @@ fn get_opencode_sessions(processes: &[AgentProcess]) -> Vec<Session> {
                 process.pid
             );
             matched_pids.insert(process.pid);
-            if let Some(session) = get_latest_session_for_project(&storage_path, project, process) {
+            if let Some(session) = get_latest_session_for_project(storage_path, project, process) {
                 sessions.push(session);
             }
         }
@@ -191,7 +204,7 @@ fn get_opencode_sessions(processes: &[AgentProcess]) -> Vec<Session> {
         if let Some(cwd) = &process.cwd {
             let cwd_str = cwd.to_string_lossy().to_string();
             if let Some(session) =
-                get_global_session_for_directory(&storage_path, &cwd_str, process)
+                get_global_session_for_directory(storage_path, &cwd_str, process)
             {
                 log::debug!(
                     "Global session matched for directory {} to process pid={}",
@@ -539,4 +552,175 @@ fn get_global_session_for_directory(
         cpu_usage: process.cpu_usage,
         active_subagent_count: 0,
     })
+}
+
+/// SQLite-backed reader for modern OpenCode (`opencode.db`).
+mod db {
+    use super::{AgentProcess, AgentType, Session, SessionStatus};
+    use rusqlite::{Connection, OpenFlags, OptionalExtension};
+    use std::path::Path;
+    use std::time::Duration;
+
+    /// One session row needed to build a `Session`.
+    struct SessionRow {
+        id: String,
+        directory: String,
+        title: String,
+        time_updated: i64,
+    }
+
+    pub fn get_sessions_from_db(
+        db_path: &Path,
+        processes: &[AgentProcess],
+    ) -> rusqlite::Result<Vec<Session>> {
+        // Read-only; OpenCode keeps the DB in WAL mode while running, so a
+        // read-only connection sees committed rows without taking write locks.
+        let conn = Connection::open_with_flags(
+            db_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        )?;
+        conn.busy_timeout(Duration::from_millis(200))?;
+
+        let mut sessions = Vec::new();
+        for process in processes {
+            let Some(cwd) = process
+                .cwd
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string())
+            else {
+                continue;
+            };
+            if let Some(row) = latest_session_for_cwd(&conn, &cwd)? {
+                sessions.push(build_session(&conn, row, process)?);
+            }
+        }
+        Ok(sessions)
+    }
+
+    /// Newest non-archived session whose directory matches the process cwd
+    /// (exact, then a parent dir), falling back to the project's worktree.
+    fn latest_session_for_cwd(
+        conn: &Connection,
+        cwd: &str,
+    ) -> rusqlite::Result<Option<SessionRow>> {
+        let by_directory = "SELECT id, directory, title, time_updated FROM session \
+             WHERE directory = ?1 OR ?1 LIKE directory || '/%' \
+             ORDER BY (time_archived IS NULL) DESC, time_updated DESC LIMIT 1";
+        if let Some(row) = query_session(conn, by_directory, cwd)? {
+            return Ok(Some(row));
+        }
+
+        let by_worktree = "SELECT s.id, s.directory, s.title, s.time_updated \
+             FROM session s JOIN project p ON s.project_id = p.id \
+             WHERE p.worktree = ?1 OR ?1 LIKE p.worktree || '/%' \
+             ORDER BY (s.time_archived IS NULL) DESC, s.time_updated DESC LIMIT 1";
+        query_session(conn, by_worktree, cwd)
+    }
+
+    fn query_session(
+        conn: &Connection,
+        sql: &str,
+        cwd: &str,
+    ) -> rusqlite::Result<Option<SessionRow>> {
+        conn.query_row(sql, [cwd], |r| {
+            Ok(SessionRow {
+                id: r.get(0)?,
+                directory: r.get(1)?,
+                title: r.get(2)?,
+                time_updated: r.get(3)?,
+            })
+        })
+        .optional()
+    }
+
+    fn build_session(
+        conn: &Connection,
+        row: SessionRow,
+        process: &AgentProcess,
+    ) -> rusqlite::Result<Session> {
+        let last_role = conn
+            .query_row(
+                "SELECT json_extract(data,'$.role') FROM message \
+                 WHERE session_id = ?1 ORDER BY time_created DESC LIMIT 1",
+                [&row.id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+
+        let last_message = last_message_text(conn, &row.id)?
+            .or_else(|| Some(row.title.clone()).filter(|t| !t.is_empty()));
+
+        let status = if process.cpu_usage > 5.0 {
+            SessionStatus::Processing
+        } else {
+            match last_role.as_deref() {
+                Some("assistant") => SessionStatus::Waiting,
+                Some("user") => SessionStatus::Processing,
+                _ => SessionStatus::Idle,
+            }
+        };
+
+        let last_activity_at = chrono::DateTime::from_timestamp_millis(row.time_updated)
+            .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
+            .unwrap_or_else(|| "Unknown".to_string());
+
+        let project_name = row
+            .directory
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .last()
+            .unwrap_or("Unknown")
+            .to_string();
+
+        Ok(Session {
+            id: row.id,
+            agent_type: AgentType::OpenCode,
+            project_name,
+            project_path: row.directory,
+            git_branch: None,
+            github_url: None,
+            status,
+            last_message,
+            last_message_role: last_role,
+            last_activity_at,
+            pid: process.pid,
+            cpu_usage: process.cpu_usage,
+            active_subagent_count: 0,
+        })
+    }
+
+    /// Most recent displayable text part for the session (prefers `text` over
+    /// `reasoning`), skipping XML-ish system prompts. Truncated to 200 chars.
+    fn last_message_text(conn: &Connection, session_id: &str) -> rusqlite::Result<Option<String>> {
+        let text: Option<String> = conn
+            .query_row(
+                "SELECT json_extract(data,'$.text') FROM part \
+                 WHERE session_id = ?1 \
+                   AND json_extract(data,'$.type') IN ('text','reasoning') \
+                   AND json_extract(data,'$.text') IS NOT NULL \
+                 ORDER BY (json_extract(data,'$.type') = 'text') DESC, time_created DESC LIMIT 1",
+                [session_id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+
+        Ok(text.and_then(sanitize))
+    }
+
+    fn sanitize(content: String) -> Option<String> {
+        let trimmed = content.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        if trimmed.starts_with('<') && (trimmed.contains("ultrawork") || trimmed.contains("mode>")) {
+            return None;
+        }
+        Some(if content.chars().count() > 200 {
+            format!("{}...", content.chars().take(197).collect::<String>())
+        } else {
+            content
+        })
+    }
 }

@@ -571,10 +571,39 @@ pub fn parse_session_file(
     // Parse the JSONL file to get session info
     let file = File::open(jsonl_path).ok()?;
     let file_size = file.metadata().ok().map(|m| m.len()).unwrap_or(0);
-    let mut reader = BufReader::new(file);
 
     let mut session_id = None;
     let mut git_branch = None;
+
+    // First pass: scan the beginning of the file for session_id and git_branch.
+    // Some agents (e.g., Droid) write session metadata in the first line
+    // (type: session_start) and never repeat it, so the tail-only approach below
+    // would miss the id on large files.
+    if let Ok(first_file) = File::open(jsonl_path) {
+        let first_reader = BufReader::new(first_file);
+        for line in first_reader.lines().take(20).flatten() {
+            if let Ok(msg) = serde_json::from_str::<JsonlMessage>(&line) {
+                if session_id.is_none() {
+                    session_id = msg.session_id.or_else(|| {
+                        if matches!(msg.msg_type.as_deref(), Some("session" | "session_start")) {
+                            msg.id
+                        } else {
+                            None
+                        }
+                    });
+                }
+                if git_branch.is_none() {
+                    git_branch = msg.git_branch;
+                }
+                if session_id.is_some() && git_branch.is_some() {
+                    break;
+                }
+            }
+        }
+    }
+
+    let mut reader = BufReader::new(file);
+
     let mut last_timestamp = None;
     let mut last_message = None;
     let mut last_role = None;
